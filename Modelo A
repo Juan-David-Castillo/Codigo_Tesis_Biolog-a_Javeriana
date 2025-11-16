@@ -1,0 +1,415 @@
+library(sivirep)
+library(lubridate)
+library(tidyverse)
+library(forecast)
+library(ggplot2)
+library(Metrics)
+
+options(scipen = 999)
+
+patch_list_events <- function(years = 2007:2024) {
+  my_list_events_safe <- function(...) {
+    data.frame(
+      codigo     = "DENGUE",
+      enfermedad = "Dengue",
+      aa         = paste(years, collapse = ", ")
+    )
+  }
+  ns <- asNamespace("sivirep")
+  ok <- FALSE
+  try({
+    if (bindingIsLocked("list_events", ns)) unlockBinding("list_events", ns)
+    assign("list_events", my_list_events_safe, envir = ns)
+    lockBinding("list_events", ns)
+    ok <- TRUE
+  }, silent = TRUE)
+  if (!ok) {
+    try({ assignInNamespace("list_events", my_list_events_safe, ns = "sivirep"); ok <- TRUE }, silent = TRUE)
+  }
+  if (ok) message("sivirep::list_events() parcheado (DENGUE, 2007–2024).") else stop("No fue posible parchear sivirep::list_events().")
+  invisible(TRUE)
+}
+
+patch_list_events(2007:2024)
+
+years_dengue <- 2007:2024
+
+dengue_raw <- import_data_event(
+  nombre_event = "DENGUE",
+  years       = years_dengue,
+  cache       = TRUE
+)
+
+dengue_limpio <- limpiar_data_sivigila(data_event = dengue_raw)
+
+dengue_cali <- dengue_limpio %>%
+  filter(municipio_ocurrencia == "CALI") %>%
+  mutate(fecha = as.Date(ini_sin)) %>%
+  filter(!is.na(fecha))
+
+first_monday_of_year <- function(year) {
+  d <- as.Date(sprintf("%d-01-01", year))
+  w <- lubridate::wday(d, week_start = 1)
+  d + ((8 - w) %% 7)
+}
+last_monday_of_year <- function(year) {
+  d <- as.Date(sprintf("%d-12-31", year))
+  w <- lubridate::wday(d, week_start = 1)
+  d - ((w - 1) %% 7)
+}
+mondays_in_year <- function(year) {
+  seq.Date(first_monday_of_year(year), last_monday_of_year(year), by = "week")
+}
+
+all_mondays <- tibble(
+  semana = seq.Date(first_monday_of_year(2007), last_monday_of_year(2024), by = "week")
+)
+
+weekly_counts <- dengue_cali %>%
+  mutate(semana = floor_date(fecha, unit = "week", week_start = 1)) %>%
+  count(semana, name = "casos")
+
+weekly_full <- all_mondays %>%
+  left_join(weekly_counts, by = "semana") %>%
+  mutate(casos = replace_na(casos, 0L))
+
+interval_score <- function(lo, hi, y, alpha, na.rm = TRUE) {
+  width <- hi - lo
+  overL <- pmax(lo - y, 0)
+  overU <- pmax(y - hi, 0)
+  s <- width + (2/alpha) * (overL + overU)
+  if (na.rm) mean(s, na.rm = TRUE) else s
+}
+
+safe_metrics <- function(actual, pred, y_train, m = 52, clip = 10,
+                         bands = list(),
+                         na.rm = TRUE) {
+  eps <- 1e-8
+  ae  <- abs(actual - pred)
+  se  <- (actual - pred)^2
+  
+  smape <- mean(200 * ae / (abs(actual) + abs(pred) + eps), na.rm = na.rm)      
+  wmape <- 100 * sum(ae, na.rm = na.rm) / pmax(sum(abs(actual), na.rm = na.rm), eps)
+  mdape <- 100 * stats::median(ae / pmax(abs(actual), eps), na.rm = na.rm)    
+  
+  mape_all  <- 100 * mean(ae / pmax(abs(actual), eps), na.rm = na.rm)           
+  mape_clip <- 100 * mean(ae / pmax(abs(actual), clip), na.rm = na.rm)          
+  hi_idx    <- actual >= clip
+  mape_hi   <- if (any(hi_idx, na.rm = TRUE)) 100 * mean(ae[hi_idx] / abs(actual[hi_idx]), na.rm = na.rm) else NA_real_
+  
+  mae  <- mean(ae, na.rm = na.rm)
+  rmse <- sqrt(mean(se, na.rm = na.rm))
+  rmsle <- sqrt(mean((log1p(pmax(pred,0)) - log1p(pmax(actual,0)))^2, na.rm = na.rm))
+  
+  denom_mase <- mean(abs(diff(y_train, lag = m)), na.rm = TRUE)
+  mase <- if (is.finite(denom_mase) && denom_mase > eps) mean(ae, na.rm = na.rm) / denom_mase else NA_real_
+  
+  covs <- list(); iss <- list()
+  for (b in bands) {
+    alpha <- 1 - b$level/100
+    covs[[paste0("Cov", b$level)]] <- mean(actual >= b$lo & actual <= b$hi, na.rm = TRUE) * 100
+    iss[[paste0("IS", b$level)]]   <- interval_score(b$lo, b$hi, actual, alpha, na.rm = TRUE)
+  }
+  
+  out <- tibble::tibble(
+    MAE   = round(mae, 2),
+    RMSE  = round(rmse, 2),
+    sMAPE = round(smape, 2),
+    WMAPE = round(wmape, 2),
+    MdAPE = round(mdape, 2),
+    MAPE  = round(mape_all, 2),      
+    MAPE_clip = round(mape_clip, 2),
+    MAPE_hi   = round(mape_hi, 2),
+    RMSLE = round(rmsle, 4),
+    MASE  = round(mase, 3)
+  )
+  
+  for (nm in names(covs)) out[[nm]] <- round(covs[[nm]], 1)
+  for (nm in names(iss))  out[[nm]] <- round(iss[[nm]], 2)
+  out
+}
+
+fit_and_forecast_one_year <- function(train_end_year, forecast_year, weekly_df,
+                                      clip = 10, N = 2000, seed = 123,
+                                      point = c("median","mean"),
+                                      levels = c(80, 95)) {
+  point <- match.arg(point)
+  train_end <- last_monday_of_year(train_end_year)
+  y_train_vec <- weekly_df %>%
+    dplyr::filter(semana >= first_monday_of_year(2007), semana <= train_end) %>%
+    dplyr::arrange(semana) %>%
+    dplyr::pull(casos)
+  
+  y_raw <- ts(y_train_vec, start = c(2007, 1), frequency = 52)
+  
+  y_pos  <- y_raw + 1
+  lambda <- forecast::BoxCox.lambda(y_pos, lower = 0)
+  y_bc   <- forecast::BoxCox(y_pos, lambda)
+  
+  d_sug <- forecast::ndiffs(y_bc)
+  D_sug <- forecast::nsdiffs(y_bc, m = frequency(y_bc))
+  
+  modelo <- forecast::auto.arima(
+    y_bc,
+    d = d_sug, D = max(1, D_sug),
+    seasonal = TRUE,
+    stepwise = FALSE, approximation = FALSE,
+    lambda = NULL, biasadj = FALSE,
+    allowdrift = FALSE, allowmean = FALSE
+  )
+  
+  semanas_forecast <- mondays_in_year(forecast_year)
+  h <- length(semanas_forecast)
+  
+  set.seed(seed)
+  sim_bc <- replicate(
+    N,
+    as.numeric(
+      stats::simulate(
+        object    = modelo,
+        nsim      = h,
+        future    = TRUE,
+        bootstrap = TRUE
+      )
+    )
+  )
+  
+  to_orig <- function(z) pmax(forecast::InvBoxCox(z, lambda) - 1, 0)
+  sim_orig <- apply(sim_bc, 2, to_orig) 
+  
+  if (point == "median") {
+    pred_point <- apply(sim_orig, 1, stats::median, na.rm = TRUE)
+  } else {
+    pred_point <- rowMeans(sim_orig, na.rm = TRUE)
+  }
+  
+  pred_df <- tibble(semana = semanas_forecast, casos_predichos = as.numeric(pred_point))
+  band_list <- list()
+  for (lvl in sort(unique(levels))) {
+    alpha <- 1 - lvl/100
+    lo <- apply(sim_orig, 1, stats::quantile, probs = alpha/2,   na.rm = TRUE, names = FALSE)
+    hi <- apply(sim_orig, 1, stats::quantile, probs = 1-alpha/2, na.rm = TRUE, names = FALSE)
+    pred_df[[paste0("lo", lvl)]] <- lo
+    pred_df[[paste0("hi", lvl)]] <- hi
+    band_list[[length(band_list)+1]] <- list(level = lvl, lo = lo, hi = hi)
+  }
+  
+  reales_df <- weekly_df %>%
+    dplyr::filter(semana >= first_monday_of_year(forecast_year),
+                  semana <= last_monday_of_year(forecast_year)) %>%
+    dplyr::select(semana, casos)
+  
+  comparacion <- pred_df %>%
+    dplyr::left_join(reales_df, by = "semana") %>%
+    dplyr::rename(casos_reales = casos) %>%
+    dplyr::mutate(
+      casos_reales = tidyr::replace_na(casos_reales, 0),
+      residuo      = casos_reales - casos_predichos
+    )
+  
+  metrics_tbl <- safe_metrics(
+    actual = comparacion$casos_reales,
+    pred   = comparacion$casos_predichos,
+    y_train = y_train_vec,
+    m = 52, clip = clip,
+    bands = band_list
+  )
+  
+  list(
+    modelo = modelo,
+    lambda = lambda,
+    comparacion = comparacion,
+    metrics = dplyr::mutate(metrics_tbl, Anio = forecast_year, .before = 1)
+  )
+}
+
+res_2021 <- fit_and_forecast_one_year(2020, 2021, weekly_full, clip = 10, N = 5000, seed = 123,
+                                      point = "median", levels = c(80, 95))
+res_2022 <- fit_and_forecast_one_year(2021, 2022, weekly_full, clip = 10, N = 5000, seed = 123,
+                                      point = "median", levels = c(80, 95))
+res_2023 <- fit_and_forecast_one_year(2022, 2023, weekly_full, clip = 10, N = 5000, seed = 123,
+                                      point = "median", levels = c(80, 95))
+res_2024 <- fit_and_forecast_one_year(2023, 2024, weekly_full, clip = 10, N = 5000, seed = 123,
+                                      point = "median", levels = c(80, 95))
+
+comparacion_2021 <- res_2021$comparacion
+comparacion_2022 <- res_2022$comparacion
+comparacion_2023 <- res_2023$comparacion
+comparacion_2024 <- res_2024$comparacion
+
+tabla_metricas <- bind_rows(
+  res_2021$metrics,
+  res_2022$metrics,
+  res_2023$metrics,
+  res_2024$metrics
+) %>% arrange(Anio)
+
+print(tabla_metricas)
+
+pretty_pct <- function(x) ifelse(is.na(x), NA, paste0(format(round(x, 1), nsmall = 1), "%"))
+tabla_metricas_pretty <- tabla_metricas %>%
+  mutate(
+    sMAPE = pretty_pct(sMAPE),
+    WMAPE = pretty_pct(WMAPE),
+    MdAPE = pretty_pct(MdAPE),
+    MAPE  = pretty_pct(MAPE),        
+    MAPE_clip = pretty_pct(MAPE_clip),
+    MAPE_hi   = pretty_pct(MAPE_hi)
+  )
+
+for (lvl in c(50, 80, 90, 95)) {
+  cov_col <- paste0("Cov", lvl)
+  is_col  <- paste0("IS",  lvl)
+  if (cov_col %in% names(tabla_metricas_pretty))
+    tabla_metricas_pretty[[cov_col]] <- pretty_pct(tabla_metricas[[cov_col]])
+  if (is_col %in% names(tabla_metricas_pretty))
+    tabla_metricas_pretty[[is_col]] <- format(round(tabla_metricas[[is_col]], 2), nsmall = 2)
+}
+
+print(tabla_metricas_pretty, row.names = FALSE)
+
+plot_real_vs_pred <- function(comp_df, year, show_bands = TRUE,
+                              titulo = "Eventos de Dengue en Cali - Modelo A (SARIMA)") {
+  band_cols <- names(comp_df)
+  los <- grep("^lo\\d+$", band_cols, value = TRUE)
+  if (length(los) > 0) {
+    his <- gsub("^lo", "hi", los)
+    niveles <- as.integer(gsub("^lo", "", los))
+    ord <- order(niveles, decreasing = TRUE)
+    los <- los[ord]; his <- his[ord]
+  }
+  
+  g <- ggplot(comp_df, aes(x = semana))
+  
+  if (show_bands && length(los) >= 1) {
+    g <- g +
+      geom_ribbon(
+        aes(x = semana, ymin = .data[[los[1]]], ymax = .data[[his[1]]]),
+        alpha = 0.10, inherit.aes = FALSE, show.legend = FALSE
+      )
+    if (length(los) >= 2) {
+      g <- g +
+        geom_ribbon(
+          aes(x = semana, ymin = .data[[los[2]]], ymax = .data[[his[2]]]),
+          alpha = 0.20, inherit.aes = FALSE, show.legend = FALSE
+        )
+    }
+  }
+  
+  g <- g +
+    geom_line(aes(y = casos_reales,    linetype = "Observados", color = "Observados"), linewidth = 1) +
+    geom_line(aes(y = casos_predichos, linetype = "Predichos",  color = "Predichos")) +
+    scale_linetype_manual(
+      name   = "Serie",
+      values = c("Observados" = "solid", "Predichos" = "dashed"),
+      breaks = c("Observados", "Predichos"),
+      labels = c("Observados (línea continua)", "Predichos (línea punteada)")
+    ) +
+    scale_color_manual(
+      name   = "Serie",
+      values = c("Observados" = "black", "Predichos" = "darkblue"),
+      breaks = c("Observados", "Predichos"),
+      labels = c("Observados (línea continua)", "Predichos (línea punteada)")
+    ) +
+    labs(
+      title = paste0(titulo, " (", year, ")"),
+      x = "Tiempo (semanas)",
+      y = "Eventos de dengue"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.box = "horizontal",
+      plot.title = element_text(hjust = 0.5)
+    )
+  
+  print(g)
+}
+
+plot_real_vs_pred(comparacion_2021, 2021, show_bands = FALSE)
+plot_real_vs_pred(comparacion_2022, 2022, show_bands = FALSE)
+plot_real_vs_pred(comparacion_2023, 2023, show_bands = FALSE)
+plot_real_vs_pred(comparacion_2024, 2024, show_bands = FALSE)
+
+weekly_with_snaive <- weekly_full %>%
+  arrange(semana) %>%
+  mutate(snaive = dplyr::lag(casos, n = 52))
+
+compute_tests <- function(res_obj) {
+  comp <- res_obj$comparacion %>%
+    dplyr::left_join(weekly_with_snaive %>% dplyr::select(semana, snaive), by = "semana")
+  
+  e_model <- comp$casos_reales - comp$casos_predichos
+  e_snv   <- comp$casos_reales - comp$snaive
+  idx <- is.finite(e_model) & is.finite(e_snv)
+  
+  dm <- tryCatch(
+    forecast::dm.test(e_model[idx], e_snv[idx], alternative = "less", h = 1, power = 2),
+    error = function(e) NULL
+  )
+  DM_stat <- if (is.null(dm)) NA_real_ else unname(as.numeric(dm$statistic))
+  DM_pval <- if (is.null(dm)) NA_real_ else unname(dm$p.value)
+  
+  r <- stats::residuals(res_obj$modelo)
+  k <- length(stats::coef(res_obj$modelo))
+  lag_lb <- min(52, length(r) - k - 1)
+  if (is.na(lag_lb) || lag_lb < 1) {
+    LB_stat <- NA_real_; LB_pval <- NA_real_; LB_df <- NA_integer_
+  } else {
+    lb <- Box.test(r, lag = lag_lb, type = "Ljung-Box", fitdf = k)
+    LB_stat <- unname(as.numeric(lb$statistic))
+    LB_pval <- lb$p.value
+    LB_df   <- lag_lb - k
+  }
+  
+  tibble::tibble(
+    DM_stat = DM_stat, DM_pvalue = DM_pval,
+    LB_stat = LB_stat, LB_df = LB_df, LB_pvalue = LB_pval,
+    LB_lag  = lag_lb
+  )
+}
+
+tests_tbl <- dplyr::bind_rows(
+  compute_tests(res_2021) %>% dplyr::mutate(Anio = 2021),
+  compute_tests(res_2022) %>% dplyr::mutate(Anio = 2022),
+  compute_tests(res_2023) %>% dplyr::mutate(Anio = 2023),
+  compute_tests(res_2024) %>% dplyr::mutate(Anio = 2024)
+)
+
+tabla_metricas_ext <- tabla_metricas %>%
+  dplyr::left_join(tests_tbl, by = "Anio")
+
+print(tabla_metricas_ext)
+
+tabla_metricas_pretty_ext <- tabla_metricas_pretty %>%
+  dplyr::left_join(tests_tbl, by = "Anio") %>%
+  dplyr::mutate(
+    DM_stat   = round(DM_stat, 3),
+    DM_pvalue = formatC(DM_pvalue, format = "f", digits = 4),
+    LB_stat   = round(LB_stat, 2),
+    LB_pvalue = formatC(LB_pvalue, format = "f", digits = 4)
+  )
+
+print(tabla_metricas_pretty_ext, row.names = FALSE)
+
+if (!requireNamespace("writexl", quietly = TRUE)) {
+  install.packages("writexl")
+}
+writexl::write_xlsx(tabla_metricas_ext, path = "tabla_metricas_con_DM_LB.xlsx")
+cat("Archivo Excel exportado: tabla_metricas_con_DM_LB.xlsx\n")
+
+resultados_modelo_A <- dplyr::bind_rows(
+  comparacion_2021 %>% dplyr::mutate(Anio = 2021, Modelo = "A"),
+  comparacion_2022 %>% dplyr::mutate(Anio = 2022, Modelo = "A"),
+  comparacion_2023 %>% dplyr::mutate(Anio = 2023, Modelo = "A"),
+  comparacion_2024 %>% dplyr::mutate(Anio = 2024, Modelo = "A")
+) %>%
+  dplyr::select(
+    Anio, Modelo, semana,
+    casos_reales,
+    casos_predichos
+  )
+
+saveRDS(resultados_modelo_A, file = "resultados_modelo_A_2021_2024.rds")
+cat("Guardado: resultados_modelo_A_2021_2024.rds\n")
