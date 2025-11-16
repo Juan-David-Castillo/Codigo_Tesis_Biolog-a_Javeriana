@@ -1,0 +1,655 @@
+# ======================== SARIMAX ================================
+# Ventana de entrenamiento: 2007 ... último lunes del año t-1
+# Transformación: Box-Cox sobre (y+1)
+# Estacionalidad forzada: D >= 1
+# Sin drift ni mean
+# Bootstrap: N = 5000 (mediana como punto)
+# Con baseline snaive + pruebas DM y Ljung-Box
+# Exporta métricas a Excel
+# =================================================================
+library(sivirep)
+library(lubridate)
+library(tidyverse)
+library(forecast)
+library(ggplot2)
+library(Metrics)
+library(httr)
+library(jsonlite)
+library(writexl)
+
+options(scipen = 999)
+
+patch_list_events <- function(years = 2007:2024) {
+  my_list_events_safe <- function(...) {
+    data.frame(codigo = "DENGUE", enfermedad = "Dengue", aa = paste(years, collapse = ", "))
+  }
+  ns <- asNamespace("sivirep"); ok <- FALSE
+  try({
+    if (bindingIsLocked("list_events", ns)) unlockBinding("list_events", ns)
+    assign("list_events", my_list_events_safe, envir = ns)
+    lockBinding("list_events", ns); ok <- TRUE
+  }, silent = TRUE)
+  if (!ok) try({ assignInNamespace("list_events", my_list_events_safe, ns = "sivirep"); ok <- TRUE }, silent = TRUE)
+  if (ok) message("sivirep::list_events() parcheado (DENGUE, 2007–2024).") else stop("No fue posible parchear.")
+  invisible(TRUE)
+}
+patch_list_events(2007:2024)
+
+years_dengue <- 2007:2024
+dengue_raw   <- import_data_event(nombre_event = "DENGUE", years = years_dengue, cache = TRUE)
+dengue_clean <- limpiar_data_sivigila(data_event = dengue_raw)
+
+dengue_cali <- dengue_clean %>%
+  filter(municipio_ocurrencia == "CALI") %>%
+  mutate(fecha = as.Date(ini_sin)) %>%
+  filter(!is.na(fecha))
+
+first_monday_of_year <- function(year){
+  d <- as.Date(sprintf("%d-01-01", year))
+  w <- lubridate::wday(d, week_start = 1)
+  d + ((8 - w) %% 7)
+}
+last_monday_of_year <- function(year){
+  d <- as.Date(sprintf("%d-12-31", year))
+  w <- lubridate::wday(d, week_start = 1)
+  d - ((w - 1) %% 7)
+}
+mondays_in_year <- function(year) seq.Date(first_monday_of_year(year), last_monday_of_year(year), by = "week")
+
+all_mondays <- tibble(semana = seq.Date(first_monday_of_year(2007), last_monday_of_year(2024), by = "week"))
+
+weekly_counts <- dengue_cali %>%
+  mutate(semana = floor_date(fecha, unit = "week", week_start = 1)) %>%
+  count(semana, name = "casos")
+
+weekly_full <- all_mondays %>%
+  left_join(weekly_counts, by = "semana") %>%
+  mutate(casos = replace_na(casos, 0L)) %>%
+  arrange(semana)
+
+lat <- 3.44; lon <- -76.519722
+parameters <- c("T2M","T2M_MAX","T2M_MIN","RH2M","PRECTOTCORR")
+
+start_date <- "20070101"
+end_date   <- format(as.Date("2024-12-31") + 6, "%Y%m%d")
+
+fetch_power_daily <- function(lat, lon, parameters, start_date, end_date){
+  base_url <- "https://power.larc.nasa.gov/api/temporal/daily/point"
+  resp <- GET(url = base_url, query = list(
+    start = start_date, end = end_date,
+    latitude = lat, longitude = lon,
+    parameters = paste(parameters, collapse = ","),
+    community = "ag", format = "json"
+  ))
+  stop_for_status(resp)
+  jd <- content(resp, as = "parsed", simplifyVector = TRUE)
+  param_data <- jd$properties$parameter
+  dates <- names(param_data[[1]])
+  df <- tibble(date = as.Date(dates, format = "%Y%m%d"))
+  for (p in names(param_data)) df[[p]] <- as.numeric(unlist(param_data[[p]]))
+  df
+}
+
+climate_daily <- fetch_power_daily(lat, lon, parameters, start_date, end_date)
+
+climate_weekly <- climate_daily %>%
+  mutate(semana = floor_date(date, unit = "week", week_start = 1)) %>%
+  group_by(semana) %>%
+  summarize(
+    T2M         = mean(T2M,        na.rm = TRUE),
+    T2M_MAX     = mean(T2M_MAX,    na.rm = TRUE),
+    T2M_MIN     = mean(T2M_MIN,    na.rm = TRUE),
+    RH2M        = mean(RH2M,       na.rm = TRUE),
+    PRECTOTCORR = sum(PRECTOTCORR, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  right_join(all_mondays, by = "semana") %>%
+  arrange(semana) %>%
+  fill(T2M, T2M_MAX, T2M_MIN, RH2M, PRECTOTCORR, .direction = "downup")
+
+make_lagged_xreg <- function(weekly_meteo, vars = c("T2M","T2M_MAX","T2M_MIN","RH2M","PRECTOTCORR"),
+                             lags = 2:8){  # (ajustado: 2–8 semanas)
+  X <- weekly_meteo %>% arrange(semana)
+  for (v in vars) for (L in lags) {
+    nm <- paste0(v, "_L", L)
+    X[[nm]] <- dplyr::lag(X[[v]], n = L)
+  }
+  keep_cols <- grep("_L\\d+$", names(X), value = TRUE)
+  X %>% select(semana, all_of(keep_cols))
+}
+
+scale_train_apply <- function(x_train, x_all){
+  mu  <- colMeans(x_train, na.rm = TRUE)
+  sdv <- apply(x_train, 2, sd, na.rm = TRUE); sdv[sdv == 0] <- 1
+  list(train = scale(x_train, center = mu, scale = sdv),
+       apply = scale(x_all,   center = mu, scale = sdv))
+}
+
+xreg_full_lagged <- make_lagged_xreg(climate_weekly, lags = 2:8)
+
+interval_score <- function(lo, hi, y, alpha, na.rm = TRUE){
+  width <- hi - lo; overL <- pmax(lo - y, 0); overU <- pmax(y - hi, 0)
+  s <- width + (2/alpha) * (overL + overU)
+  if (na.rm) mean(s, na.rm = TRUE) else s
+}
+safe_metrics <- function(actual, pred, y_train, m = 52, clip = 10, bands = list(), na.rm = TRUE){
+  eps <- 1e-8
+  ae <- abs(actual - pred); se <- (actual - pred)^2
+  smape <- mean(200 * ae / (abs(actual) + abs(pred) + eps), na.rm = na.rm)
+  wmape <- 100 * sum(ae, na.rm = na.rm) / pmax(sum(abs(actual), na.rm = na.rm), eps)
+  mdape <- 100 * stats::median(ae / pmax(abs(actual), eps), na.rm = na.rm)
+  mape_all  <- 100 * mean(ae / pmax(abs(actual), eps), na.rm = na.rm)
+  mape_clip <- 100 * mean(ae / pmax(abs(actual), clip), na.rm = na.rm)
+  hi_idx <- actual >= clip
+  mape_hi <- if (any(hi_idx, na.rm = TRUE)) 100 * mean(ae[hi_idx] / abs(actual[hi_idx]), na.rm = na.rm) else NA_real_
+  mae <- mean(ae, na.rm = na.rm); rmse <- sqrt(mean(se, na.rm = na.rm))
+  rmsle <- sqrt(mean((log1p(pmax(pred,0)) - log1p(pmax(actual,0)))^2, na.rm = na.rm))
+  denom_mase <- mean(abs(diff(y_train, lag = m)), na.rm = TRUE)
+  mase <- if (is.finite(denom_mase) && denom_mase > eps) mean(ae, na.rm = na.rm) / denom_mase else NA_real_
+  covs <- list(); iss <- list()
+  for (b in bands){
+    alpha <- 1 - b$level/100
+    covs[[paste0("Cov", b$level)]] <- mean(actual >= b$lo & actual <= b$hi, na.rm = TRUE) * 100
+    iss[[paste0("IS",  b$level)]]  <- interval_score(b$lo, b$hi, actual, alpha, na.rm = TRUE)
+  }
+  out <- tibble::tibble(
+    MAE = round(mae,2), RMSE = round(rmse,2), sMAPE = round(smape,2),
+    WMAPE = round(wmape,2), MdAPE = round(mdape,2), MAPE = round(mape_all,2),
+    MAPE_clip = round(mape_clip,2), MAPE_hi = round(mape_hi,2),
+    RMSLE = round(rmsle,4), MASE = round(mase,3)
+  )
+  for (nm in names(covs)) out[[nm]] <- round(covs[[nm]], 1)
+  for (nm in names(iss))  out[[nm]] <- round(iss[[nm]], 2)
+  out
+}
+
+fit_and_forecast_one_year_SARIMAX_M1 <- function(train_end_year, forecast_year,
+                                                 weekly_df, xreg_full,
+                                                 clip = 10, N = 5000, seed = 123,
+                                                 levels = c(80,95),
+                                                 point = c("median","mean")){
+  point <- match.arg(point)
+  
+  train_end <- last_monday_of_year(train_end_year)
+  y_all <- weekly_df %>% arrange(semana) %>% pull(casos)
+  
+  y_train_all <- weekly_df %>%
+    filter(semana >= first_monday_of_year(2007), semana <= train_end) %>%
+    arrange(semana) %>% pull(casos)
+  
+  X_train_all <- xreg_full %>%
+    filter(semana >= first_monday_of_year(2007), semana <= train_end) %>%
+    arrange(semana) %>% select(-semana) %>% as.matrix()
+  
+  keep <- stats::complete.cases(X_train_all)     # quita filas con NA por lags
+  y_train <- y_train_all[keep]
+  X_train <- X_train_all[keep, , drop = FALSE]
+  
+  X_all      <- xreg_full %>% arrange(semana) %>% select(-semana) %>% as.matrix()
+  scaler     <- scale_train_apply(X_train, X_all)
+  X_train_sc <- scaler$train
+  X_all_sc   <- scaler$apply
+  
+  semanas_forecast <- mondays_in_year(forecast_year)
+  h  <- length(semanas_forecast)
+  id <- which(weekly_df$semana %in% semanas_forecast)
+  X_future_sc <- X_all_sc[id, , drop = FALSE]
+  
+  y_raw <- ts(y_train, frequency = 52)
+  y_pos <- y_raw + 1
+  lambda <- forecast::BoxCox.lambda(y_pos, lower = 0)
+  y_bc   <- forecast::BoxCox(y_pos, lambda)
+  
+  d_sug <- forecast::ndiffs(y_bc)
+  D_sug <- forecast::nsdiffs(y_bc, m = frequency(y_bc))
+  modelo <- forecast::auto.arima(
+    y_bc,
+    xreg = X_train_sc,
+    seasonal = TRUE,
+    d = d_sug, D = max(1, D_sug),
+    stepwise = FALSE, approximation = FALSE,
+    lambda = NULL, biasadj = FALSE,
+    allowdrift = FALSE, allowmean = FALSE
+  )
+  
+  set.seed(seed)
+  sim_bc <- replicate(
+    N,
+    as.numeric(stats::simulate(
+      object    = modelo,
+      nsim      = h,
+      future    = TRUE,
+      bootstrap = TRUE,
+      xreg      = X_future_sc
+    ))
+  )
+  
+  to_orig  <- function(z) pmax(forecast::InvBoxCox(z, lambda) - 1, 0)
+  sim_orig <- apply(sim_bc, 2, to_orig)
+  
+  pred_point <- if (point == "median") {
+    apply(sim_orig, 1, stats::median, na.rm = TRUE)
+  } else {
+    rowMeans(sim_orig, na.rm = TRUE)
+  }
+  
+  pred_df <- tibble(semana = semanas_forecast, casos_predichos = as.numeric(pred_point))
+  band_list <- list()
+  for (lvl in sort(unique(levels))) {
+    alpha <- 1 - lvl/100
+    lo <- apply(sim_orig, 1, quantile, probs = alpha/2,   na.rm = TRUE, names = FALSE)
+    hi <- apply(sim_orig, 1, quantile, probs = 1 - alpha/2, na.rm = TRUE, names = FALSE)
+    pred_df[[paste0("lo", lvl)]] <- lo
+    pred_df[[paste0("hi", lvl)]] <- hi
+    band_list[[length(band_list)+1]] <- list(level = lvl, lo = lo, hi = hi)
+  }
+  
+  reales_df <- weekly_df %>%
+    filter(semana >= first_monday_of_year(forecast_year),
+           semana <= last_monday_of_year(forecast_year)) %>%
+    select(semana, casos)
+  
+  comparacion <- pred_df %>%
+    left_join(reales_df, by = "semana") %>%
+    rename(casos_reales = casos) %>%
+    mutate(casos_reales = replace_na(casos_reales, 0),
+           residuo = casos_reales - casos_predichos)
+  
+  snaive_all <- dplyr::lag(y_all, 52)
+  snaive_pred <- snaive_all[id]
+  comparacion$snaive <- snaive_pred
+  
+  e_model  <- comparacion$casos_reales - comparacion$casos_predichos
+  e_snaive <- comparacion$casos_reales - comparacion$snaive
+  ok <- is.finite(e_model) & is.finite(e_snaive)
+  
+  if (sum(ok) > 5) {
+    dm <- try(
+      forecast::dm.test(
+        e_model[ok],
+        e_snaive[ok],
+        alternative = "less",
+        h = 1,
+        power = 2
+      ),
+      silent = TRUE
+    )
+    if (inherits(dm, "try-error")) {
+      DM_stat <- NA_real_
+      DM_pval <- NA_real_
+    } else {
+      DM_stat <- unname(as.numeric(dm$statistic))
+      DM_pval <- dm$p.value
+    }
+  } else {
+    DM_stat <- NA_real_
+    DM_pval <- NA_real_
+  }
+  
+  r <- stats::residuals(modelo)
+  k <- length(stats::coef(modelo))
+  lagLB <- min(52, length(r) - k - 1)
+  
+  if (is.na(lagLB) || lagLB < 1) {
+    LB_stat <- NA_real_
+    LB_pval <- NA_real_
+  } else {
+    lb <- try(
+      Box.test(r, lag = lagLB, type = "Ljung-Box", fitdf = k),
+      silent = TRUE
+    )
+    if (inherits(lb, "try-error")) {
+      LB_stat <- NA_real_
+      LB_pval <- NA_real_
+    } else {
+      LB_stat <- unname(as.numeric(lb$statistic))
+      LB_pval <- lb$p.value
+    }
+  }
+  
+  metrics_tbl <- safe_metrics(
+    actual  = comparacion$casos_reales,
+    pred    = comparacion$casos_predichos,
+    y_train = y_train,
+    m       = 52,
+    clip    = clip,
+    bands   = band_list
+  ) %>%
+    dplyr::mutate(
+      DM_stat   = round(DM_stat, 3),
+      DM_pvalue = round(DM_pval, 4),
+      LB_stat   = round(LB_stat, 3),
+      LB_pvalue = round(LB_pval, 4)
+    )
+  
+  list(modelo = modelo, lambda = lambda,
+       comparacion = comparacion,
+       metrics = dplyr::mutate(metrics_tbl, Anio = forecast_year, .before = 1))
+}
+
+seed_all <- 123
+res_2021 <- fit_and_forecast_one_year_SARIMAX_M1(2020, 2021, weekly_full, xreg_full_lagged,
+                                                 clip = 10, N = 5000, seed = seed_all, levels = c(80,95))
+res_2022 <- fit_and_forecast_one_year_SARIMAX_M1(2021, 2022, weekly_full, xreg_full_lagged,
+                                                 clip = 10, N = 5000, seed = seed_all, levels = c(80,95))
+res_2023 <- fit_and_forecast_one_year_SARIMAX_M1(2022, 2023, weekly_full, xreg_full_lagged,
+                                                 clip = 10, N = 5000, seed = seed_all, levels = c(80,95))
+res_2024 <- fit_and_forecast_one_year_SARIMAX_M1(2023, 2024, weekly_full, xreg_full_lagged,
+                                                 clip = 10, N = 5000, seed = seed_all, levels = c(80,95))
+
+comparacion_2021 <- res_2021$comparacion
+comparacion_2022 <- res_2022$comparacion
+comparacion_2023 <- res_2023$comparacion
+comparacion_2024 <- res_2024$comparacion
+
+tabla_metricas <- bind_rows(res_2021$metrics, res_2022$metrics, res_2023$metrics, res_2024$metrics) %>%
+  arrange(Anio)
+print(tabla_metricas)
+
+pretty_pct <- function(x) ifelse(is.na(x), NA, paste0(format(round(x, 1), nsmall = 1), "%"))
+tabla_metricas_pretty <- tabla_metricas %>%
+  mutate(sMAPE = pretty_pct(sMAPE),
+         WMAPE = pretty_pct(WMAPE),
+         MdAPE = pretty_pct(MdAPE),
+         MAPE  = pretty_pct(MAPE),
+         MAPE_clip = pretty_pct(MAPE_clip),
+         MAPE_hi   = pretty_pct(MAPE_hi),
+         DM_stat   = round(DM_stat, 3),
+         DM_pvalue = format(round(DM_pvalue, 4), nsmall = 4),
+         LB_stat   = round(LB_stat, 3),
+         LB_pvalue = format(round(LB_pvalue, 4), nsmall = 4))
+
+print(tabla_metricas_pretty, row.names = FALSE)
+
+plot_real_vs_pred <- function(comp_df, year, show_bands = TRUE,
+                              titulo = "Eventos de Dengue en Cali - Modelo B"){
+  band_cols <- names(comp_df)
+  los <- grep("^lo\\d+$", band_cols, value = TRUE)
+  his <- gsub("^lo", "hi", los)
+  ord <- order(as.integer(gsub("^lo", "", los)), decreasing = TRUE)
+  los <- los[ord]; his <- his[ord]
+  
+  g <- ggplot(comp_df, aes(x = semana))
+  
+  if (show_bands && length(los) >= 1) {
+    g <- g +
+      geom_ribbon(
+        aes(x = semana, ymin = .data[[los[1]]], ymax = .data[[his[1]]]),
+        alpha = 0.10, inherit.aes = FALSE, show.legend = FALSE
+      )
+    if (length(los) >= 2) {
+      g <- g +
+        geom_ribbon(
+          aes(x = semana, ymin = .data[[los[2]]], ymax = .data[[his[2]]]),
+          alpha = 0.20, inherit.aes = FALSE, show.legend = FALSE
+        )
+    }
+  }
+  
+  g <- g +
+    geom_line(aes(y = casos_reales,    linetype = "Observados", color = "Observados"), linewidth = 1) +
+    geom_line(aes(y = casos_predichos, linetype = "Predichos",  color = "Predichos")) +
+    scale_linetype_manual(
+      name   = "Serie",
+      values = c("Observados" = "solid", "Predichos" = "dashed"),
+      breaks = c("Observados", "Predichos"),
+      labels = c("Observados (línea continua)", "Predichos (línea punteada)")
+    ) +
+    scale_color_manual(
+      name   = "Serie",
+      values = c("Observados" = "black", "Predichos" = "darkblue"),
+      breaks = c("Observados", "Predichos"),
+      labels = c("Observados (línea continua)", "Predichos (línea punteada)")
+    ) +
+    labs(
+      title = paste0(titulo, " (", year, ")"),
+      x = "Tiempo (semanas)",
+      y = "Eventos de dengue"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.box = "horizontal",
+      plot.title = element_text(hjust = 0.5)
+    )
+  
+  print(g)
+}
+
+plot_real_vs_pred(comparacion_2021, 2021, show_bands = FALSE)
+plot_real_vs_pred(comparacion_2022, 2022, show_bands = FALSE)
+plot_real_vs_pred(comparacion_2023, 2023, show_bands = FALSE)
+plot_real_vs_pred(comparacion_2024, 2024, show_bands = FALSE)
+
+write_xlsx(
+  list(
+    metricas = tabla_metricas,
+    metricas_pretty = tabla_metricas_pretty
+  ),
+  path = "metricas_SARIMAX_DM_LB.xlsx"
+)
+cat("Archivo Excel exportado: metricas_SARIMAX_DM_LB.xlsx\n")
+
+
+# ---- Gráficas exógenas -------------------------------------------------------
+minmax01 <- function(x) {
+  r <- range(x, na.rm = TRUE)
+  if (!is.finite(r[1]) || !is.finite(r[2])) return(rep(NA_real_, length(x)))
+  if (diff(r) == 0) return(rep(0.5, length(x)))
+  (x - r[1]) / diff(r)
+}
+
+.var_info <- function(var = c("Temp","Hum","Prec")){
+  var <- match.arg(var)
+  switch(
+    var,
+    "Temp" = list(label = "Temperatura",   color = "red",        col = "T2M"),
+    "Hum"  = list(label = "Humedad",       color = "darkgreen",  col = "RH2M"),
+    "Prec" = list(label = "Precipitación", color = "goldenrod",  col = "PRECTOTCORR")  # <- amarillo
+  )
+}
+
+make_exog_var_year <- function(year, var = c("Temp","Hum","Prec")){
+  vi <- .var_info(var)
+  climate_weekly %>%
+    dplyr::filter(semana >= first_monday_of_year(year),
+                  semana <= last_monday_of_year(year)) %>%
+    dplyr::transmute(
+      semana,
+      Var = !!rlang::sym(vi$col)
+    ) %>%
+    dplyr::mutate(Var = minmax01(Var))
+}
+
+join_exog_var_comp <- function(year, comp_df, var = c("Temp","Hum","Prec")){
+  exog <- make_exog_var_year(year, var)
+  comp_df %>%
+    dplyr::filter(semana >= first_monday_of_year(year),
+                  semana <= last_monday_of_year(year)) %>%
+    dplyr::transmute(
+      semana,
+      Obs  = casos_reales,
+      Pred = casos_predichos
+    ) %>%
+    dplyr::mutate(
+      Obs  = minmax01(Obs),
+      Pred = minmax01(Pred)
+    ) %>%
+    dplyr::left_join(exog, by = "semana")
+}
+
+plot_var_only <- function(year, var = c("Temp","Hum","Prec"),
+                          titulo = "Variable exógena (normalizada 0–1)"){
+  vi <- .var_info(var)
+  df <- make_exog_var_year(year, var)
+  ggplot(df, aes(semana, Var)) +
+    geom_line(linewidth = 0.6, color = vi$color) +
+    labs(
+      title = paste0(titulo, " - ", vi$label, " (", year, ")"),
+      x = "Semana (lunes)", y = "Escala normalizada (0–1)"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+
+plot_var_vs_obs <- function(year, comp_df, var = c("Temp","Hum","Prec"),
+                            titulo = "Exógena vs Observado (0–1)"){
+  vi <- .var_info(var)
+  df <- join_exog_var_comp(year, comp_df, var) %>%
+    tidyr::pivot_longer(cols = c(Var, Obs), names_to = "serie", values_to = "valor")
+  
+  ggplot(df, aes(semana, valor, color = serie, linetype = serie)) +
+    geom_line(linewidth = 0.6) +
+    scale_color_manual(
+      values = c(Obs = "black", Var = vi$color),
+      breaks = c("Obs","Var"),
+      labels = c("Observados", vi$label),
+      name   = "Serie"
+    ) +
+    scale_linetype_manual(
+      values = c(Obs = "solid", Var = "solid"),
+      breaks = c("Obs","Var"),
+      labels = c("Observados", vi$label),
+      name   = "Serie"
+    ) +
+    labs(
+      title = paste0(titulo, " - ", vi$label, " (", year, ")"),
+      x = "Semana (lunes)", y = "Escala normalizada (0–1)"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5)
+    )
+}
+
+plot_var_vs_pred <- function(year, comp_df, var = c("Temp","Hum","Prec"),
+                             titulo = "Exógena vs Predicho (0–1)"){
+  vi <- .var_info(var)
+  df <- join_exog_var_comp(year, comp_df, var) %>%
+    tidyr::pivot_longer(cols = c(Var, Pred), names_to = "serie", values_to = "valor")
+  
+  ggplot(df, aes(semana, valor, color = serie, linetype = serie)) +
+    geom_line(linewidth = 0.6) +
+    scale_color_manual(
+      values = c(Var = vi$color, Pred = "darkblue"),
+      breaks = c("Pred","Var"),
+      labels = c("Predichos", vi$label),
+      name   = "Serie"
+    ) +
+    scale_linetype_manual(
+      values = c(Var = "solid", Pred = "dashed"),
+      breaks = c("Pred","Var"),
+      labels = c("Predichos", vi$label),
+      name   = "Serie"
+    ) +
+    labs(
+      title = paste0(titulo, " - ", vi$label, " (", year, ")"),
+      x = "Semana (lunes)", y = "Escala normalizada (0–1)"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5)
+    )
+}
+
+plot_var_vs_both <- function(year, comp_df, var = c("Temp","Hum","Prec"),
+                             titulo = "Exógena vs Observado y Predicho (0–1)"){
+  vi <- .var_info(var)
+  df <- join_exog_var_comp(year, comp_df, var) %>%
+    tidyr::pivot_longer(cols = c(Var, Obs, Pred), names_to = "serie", values_to = "valor")
+  
+  ggplot(df, aes(semana, valor, color = serie, linetype = serie)) +
+    geom_line(linewidth = 0.6) +
+    scale_color_manual(
+      values = c(Obs = "black", Pred = "darkblue", Var = vi$color),
+      breaks = c("Obs","Pred","Var"),
+      labels = c("Observados", "Predichos", vi$label),
+      name   = "Serie"
+    ) +
+    scale_linetype_manual(
+      values = c(Obs = "solid", Pred = "dashed", Var = "solid"),
+      breaks = c("Obs","Pred","Var"),
+      labels = c("Observados", "Predichos", vi$label),
+      name   = "Serie"
+    ) +
+    labs(
+      title = paste0(titulo, " - ", vi$label, " (", year, ")"),
+      x = "Semana (lunes)", y = "Escala normalizada (0–1)"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5)
+    )
+}
+
+plot_obs_vs_exog_all <- function(year, comp_df) {
+  for (vv in c("Temp", "Hum", "Prec")) {
+    print(
+      plot_var_vs_obs(
+        year, comp_df, vv,
+        titulo = "Datos observados vs variable exógena (0–1)"
+      )
+    )
+  }
+}
+
+plot_pred_vs_exog_all <- function(year, comp_df) {
+  for (vv in c("Temp", "Hum", "Prec")) {
+    print(
+      plot_var_vs_pred(
+        year, comp_df, vv,
+        titulo = "Datos predichos vs variable exógena (0–1)"
+      )
+    )
+  }
+}
+
+plot_obs_pred_vs_exog_all <- function(year, comp_df) {
+  for (vv in c("Temp", "Hum", "Prec")) {
+    print(
+      plot_var_vs_both(
+        year, comp_df, vv,
+        titulo = "Observados y predichos vs variable exógena (0–1)"
+      )
+    )
+  }
+}
+
+# 2021
+plot_obs_vs_exog_all(2021, comparacion_2021)
+plot_pred_vs_exog_all(2021, comparacion_2021)
+plot_obs_pred_vs_exog_all(2021, comparacion_2021)
+
+# 2022
+plot_obs_vs_exog_all(2022, comparacion_2022)
+plot_pred_vs_exog_all(2022, comparacion_2022)
+plot_obs_pred_vs_exog_all(2022, comparacion_2022)
+
+# 2023
+plot_obs_vs_exog_all(2023, comparacion_2023)
+plot_pred_vs_exog_all(2023, comparacion_2023)
+plot_obs_pred_vs_exog_all(2023, comparacion_2023)
+
+# 2024
+plot_obs_vs_exog_all(2024, comparacion_2024)
+plot_pred_vs_exog_all(2024, comparacion_2024)
+plot_obs_pred_vs_exog_all(2024, comparacion_2024)
+
+resultados_modelo_B <- dplyr::bind_rows(
+  comparacion_2021 %>% dplyr::mutate(Anio = 2021, Modelo = "B"),
+  comparacion_2022 %>% dplyr::mutate(Anio = 2022, Modelo = "B"),
+  comparacion_2023 %>% dplyr::mutate(Anio = 2023, Modelo = "B"),
+  comparacion_2024 %>% dplyr::mutate(Anio = 2024, Modelo = "B")
+) %>%
+  dplyr::select(
+    Anio, Modelo, semana,
+    casos_reales,
+    casos_predichos
+  )
+
+saveRDS(resultados_modelo_B, file = "resultados_modelo_B_2021_2024.rds")
+cat("Guardado: resultados_modelo_B_2021_2024.rds\n")
