@@ -427,9 +427,9 @@ write_xlsx(
     metricas = tabla_metricas,
     metricas_pretty = tabla_metricas_pretty
   ),
-  path = "metricas_SARIMAX_DM_LB.xlsx"
+  path = "Metricas_Modelo B.xlsx"
 )
-cat("Archivo Excel exportado: metricas_SARIMAX_DM_LB.xlsx\n")
+cat("Archivo Excel exportado: Metricas_Modelo B.xlsx\n")
 
 
 # ---- Gráficas exógenas -------------------------------------------------------
