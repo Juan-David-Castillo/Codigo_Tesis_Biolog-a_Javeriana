@@ -396,8 +396,8 @@ print(tabla_metricas_pretty_ext, row.names = FALSE)
 if (!requireNamespace("writexl", quietly = TRUE)) {
   install.packages("writexl")
 }
-writexl::write_xlsx(tabla_metricas_ext, path = "tabla_metricas_con_DM_LB.xlsx")
-cat("Archivo Excel exportado: tabla_metricas_con_DM_LB.xlsx\n")
+writexl::write_xlsx(tabla_metricas_ext, path = "Metricas_Modelo A.xlsx")
+cat("Archivo Excel exportado: Metricas_Modelo A.xlsx\n")
 
 resultados_modelo_A <- dplyr::bind_rows(
   comparacion_2021 %>% dplyr::mutate(Anio = 2021, Modelo = "A"),
