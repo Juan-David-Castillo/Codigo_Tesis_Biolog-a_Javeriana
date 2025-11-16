@@ -511,8 +511,8 @@ plot_real_vs_pred_C(comparacionC_2022, 2022, show_bands = FALSE)
 plot_real_vs_pred_C(comparacionC_2023, 2023, show_bands = FALSE)
 plot_real_vs_pred_C(comparacionC_2024, 2024, show_bands = FALSE)
 
-writexl::write_xlsx(tabla_metricas_C_ext, path = "tabla_metricas_modelo_C_con_DM_LB.xlsx")
-cat("Archivo Excel exportado: tabla_metricas_modelo_C_con_DM_LB.xlsx\n")
+writexl::write_xlsx(tabla_metricas_C_ext, path = "Metricas_Modelo C.xlsx")
+cat("Archivo Excel exportado: Metricas_Modelo C.xlsx\n")
 
 resultados_modelo_C <- dplyr::bind_rows(
   comparacionC_2021 %>% dplyr::mutate(Anio = 2021, Modelo = "C"),
