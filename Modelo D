@@ -1,0 +1,574 @@
+# ======================== MODELO D ================================
+# SARIMAX con dos bloques de covariables:
+#   - Clima (NASA POWER: T2M, T2M_MAX, T2M_MIN, RH2M, PRECTOTCORR)
+#   - Google Trends "dengue" (Valle del Cauca)
+# Rezagos: 2–8 semanas para todas las exógenas
+# Ventana de entrenamiento: 2007 ... último lunes del año t-1
+# Transformación: Box-Cox sobre (y+1)
+# Baseline: snaive, DM y Ljung–Box
+# Predicción 2021–2024
+# ================================================================
+
+library(sivirep)
+library(lubridate)
+library(tidyverse)
+library(forecast)
+library(ggplot2)
+library(Metrics)
+library(httr)
+library(jsonlite)
+library(readr)
+library(writexl)
+library(future)
+library(furrr)
+
+options(scipen = 999)
+
+## --- 1) Casos de dengue semanales (weekly_full) -----------------
+
+patch_list_events <- function(years = 2007:2024) {
+  my_list_events_safe <- function(...) {
+    data.frame(
+      codigo     = "DENGUE",
+      enfermedad = "Dengue",
+      aa         = paste(years, collapse = ", ")
+    )
+  }
+  ns <- asNamespace("sivirep"); ok <- FALSE
+  try({
+    if (bindingIsLocked("list_events", ns)) unlockBinding("list_events", ns)
+    assign("list_events", my_list_events_safe, envir = ns)
+    lockBinding("list_events", ns); ok <- TRUE
+  }, silent = TRUE)
+  if (!ok) {
+    try({ assignInNamespace("list_events", my_list_events_safe, ns = "sivirep"); ok <- TRUE }, silent = TRUE)
+  }
+  if (ok) message("sivirep::list_events() parcheado (DENGUE, 2007–2024).")
+  else stop("No fue posible parchear sivirep::list_events().")
+  invisible(TRUE)
+}
+
+patch_list_events(2007:2024)
+
+years_dengue <- 2007:2024
+dengue_raw   <- import_data_event(nombre_event = "DENGUE", years = years_dengue, cache = TRUE)
+dengue_clean <- limpiar_data_sivigila(data_event = dengue_raw)
+
+dengue_cali <- dengue_clean %>%
+  filter(municipio_ocurrencia == "CALI") %>%
+  mutate(fecha = as.Date(ini_sin)) %>%
+  filter(!is.na(fecha))
+
+first_monday_of_year <- function(year) {
+  d <- as.Date(sprintf("%d-01-01", year))
+  w <- lubridate::wday(d, week_start = 1)
+  d + ((8 - w) %% 7)
+}
+last_monday_of_year <- function(year) {
+  d <- as.Date(sprintf("%d-12-31", year))
+  w <- lubridate::wday(d, week_start = 1)
+  d - ((w - 1) %% 7)
+}
+mondays_in_year <- function(year) {
+  seq.Date(first_monday_of_year(year), last_monday_of_year(year), by = "week")
+}
+
+all_mondays <- tibble(
+  semana = seq.Date(first_monday_of_year(2007),
+                    last_monday_of_year(2024),
+                    by = "week")
+)
+
+weekly_counts <- dengue_cali %>%
+  mutate(semana = floor_date(fecha, unit = "week", week_start = 1)) %>%
+  count(semana, name = "casos")
+
+weekly_full <- all_mondays %>%
+  left_join(weekly_counts, by = "semana") %>%
+  mutate(casos = replace_na(casos, 0L)) %>%
+  arrange(semana)
+
+## --- 2) Covariables climáticas (como Modelo B) ------------------
+
+lat <- 3.44; lon <- -76.519722
+parameters <- c("T2M","T2M_MAX","T2M_MIN","RH2M","PRECTOTCORR")
+
+start_date <- "20070101"
+end_date   <- format(as.Date("2024-12-31") + 6, "%Y%m%d")
+
+fetch_power_daily <- function(lat, lon, parameters, start_date, end_date){
+  base_url <- "https://power.larc.nasa.gov/api/temporal/daily/point"
+  resp <- GET(url = base_url, query = list(
+    start = start_date, end = end_date,
+    latitude = lat, longitude = lon,
+    parameters = paste(parameters, collapse = ","),
+    community = "ag", format = "json"
+  ))
+  stop_for_status(resp)
+  jd <- content(resp, as = "parsed", simplifyVector = TRUE)
+  param_data <- jd$properties$parameter
+  dates <- names(param_data[[1]])
+  df <- tibble(date = as.Date(dates, format = "%Y%m%d"))
+  for (p in names(param_data)) df[[p]] <- as.numeric(unlist(param_data[[p]]))
+  df
+}
+
+climate_daily <- fetch_power_daily(lat, lon, parameters, start_date, end_date)
+
+climate_weekly <- climate_daily %>%
+  mutate(semana = floor_date(date, unit = "week", week_start = 1)) %>%
+  group_by(semana) %>%
+  summarize(
+    T2M         = mean(T2M,        na.rm = TRUE),
+    T2M_MAX     = mean(T2M_MAX,    na.rm = TRUE),
+    T2M_MIN     = mean(T2M_MIN,    na.rm = TRUE),
+    RH2M        = mean(RH2M,       na.rm = TRUE),
+    PRECTOTCORR = sum(PRECTOTCORR, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  right_join(all_mondays, by = "semana") %>%
+  arrange(semana) %>%
+  fill(T2M, T2M_MAX, T2M_MIN, RH2M, PRECTOTCORR, .direction = "downup")
+
+make_lagged_clima <- function(weekly_meteo,
+                              vars = c("T2M","T2M_MAX","T2M_MIN","RH2M","PRECTOTCORR"),
+                              lags = 2:8){
+  X <- weekly_meteo %>% arrange(semana)
+  for (v in vars) for (L in lags) {
+    nm <- paste0(v, "_L", L)
+    X[[nm]] <- dplyr::lag(X[[v]], n = L)
+  }
+  keep_cols <- grep("_L\\d+$", names(X), value = TRUE)
+  X %>% select(semana, all_of(keep_cols))
+}
+
+## --- 3) Covariables Google Trends (como Modelo C) ---------------
+
+gt_raw <- read_csv(
+  "multiTimeline.csv",
+  skip = 2,
+  col_types = cols()
+)
+
+nombre_col_gt <- names(gt_raw)[2]
+
+gt_monthly <- gt_raw %>%
+  rename(
+    Mes_char      = 1,
+    gt_dengue_raw = !!sym(nombre_col_gt)
+  ) %>%
+  mutate(
+    mes       = lubridate::ym(Mes_char),
+    gt_dengue = as.numeric(gt_dengue_raw)
+  ) %>%
+  filter(
+    !is.na(mes),
+    !is.na(gt_dengue),
+    mes >= as.Date("2007-01-01"),
+    mes <= as.Date("2024-12-31")
+  ) %>%
+  select(mes, gt_dengue) %>%
+  arrange(mes)
+
+gt_weekly <- weekly_full %>%
+  mutate(mes = floor_date(semana, unit = "month")) %>%
+  left_join(gt_monthly, by = "mes") %>%
+  select(semana, gt_dengue) %>%
+  arrange(semana) %>%
+  tidyr::fill(gt_dengue, .direction = "downup")
+
+make_lagged_gt <- function(weekly_gt, lags = 2:8){
+  X <- weekly_gt %>% arrange(semana)
+  for (L in lags) {
+    nm <- paste0("GT_L", L)
+    X[[nm]] <- dplyr::lag(X$gt_dengue, n = L)
+  }
+  X %>% select(semana, starts_with("GT_L"))
+}
+
+## --- 4) Matriz combinada de covariables (clima + GT) ------------
+
+xreg_clima_lagged <- make_lagged_clima(climate_weekly, lags = 2:8)
+xreg_gt_lagged    <- make_lagged_gt(gt_weekly,      lags = 2:8)
+
+xreg_D_full <- weekly_full %>%
+  left_join(xreg_clima_lagged, by = "semana") %>%
+  left_join(xreg_gt_lagged,    by = "semana")
+
+## --- 5) Escalado, métricas y función de ajuste SARIMAX ----------
+
+scale_train_apply <- function(x_train, x_all){
+  mu  <- colMeans(x_train, na.rm = TRUE)
+  sdv <- apply(x_train, 2, sd, na.rm = TRUE)
+  sdv[sdv == 0] <- 1
+  list(
+    train = scale(x_train, center = mu, scale = sdv),
+    apply = scale(x_all,   center = mu, scale = sdv)
+  )
+}
+
+interval_score <- function(lo, hi, y, alpha, na.rm = TRUE){
+  width <- hi - lo
+  overL <- pmax(lo - y, 0)
+  overU <- pmax(y - hi, 0)
+  s <- width + (2/alpha) * (overL + overU)
+  if (na.rm) mean(s, na.rm = TRUE) else s
+}
+
+safe_metrics <- function(actual, pred, y_train,
+                         m = 52, clip = 10,
+                         bands = list(),
+                         na.rm = TRUE){
+  eps <- 1e-8
+  ae  <- abs(actual - pred)
+  se  <- (actual - pred)^2
+  
+  smape <- mean(200 * ae / (abs(actual) + abs(pred) + eps), na.rm = na.rm)
+  wmape <- 100 * sum(ae, na.rm = na.rm) / pmax(sum(abs(actual), na.rm = na.rm), eps)
+  mdape <- 100 * stats::median(ae / pmax(abs(actual), eps), na.rm = na.rm)
+  
+  mape_all  <- 100 * mean(ae / pmax(abs(actual), eps), na.rm = na.rm)
+  mape_clip <- 100 * mean(ae / pmax(abs(actual), clip), na.rm = na.rm)
+  hi_idx    <- actual >= clip
+  mape_hi   <- if (any(hi_idx, na.rm = TRUE)) 100 * mean(ae[hi_idx] / abs(actual[hi_idx]), na.rm = na.rm) else NA_real_
+  
+  mae   <- mean(ae, na.rm = na.rm)
+  rmse  <- sqrt(mean(se, na.rm = na.rm))
+  rmsle <- sqrt(mean((log1p(pmax(pred,0)) - log1p(pmax(actual,0)))^2, na.rm = na.rm))
+  
+  denom_mase <- mean(abs(diff(y_train, lag = m)), na.rm = TRUE)
+  mase <- if (is.finite(denom_mase) && denom_mase > eps) mean(ae, na.rm = na.rm) / denom_mase else NA_real_
+  
+  covs <- list(); iss <- list()
+  for (b in bands){
+    alpha <- 1 - b$level/100
+    covs[[paste0("Cov", b$level)]] <- mean(actual >= b$lo & actual <= b$hi, na.rm = TRUE) * 100
+    iss[[paste0("IS",  b$level)]]  <- interval_score(b$lo, b$hi, actual, alpha, na.rm = TRUE)
+  }
+  
+  out <- tibble(
+    MAE   = round(mae, 2),
+    RMSE  = round(rmse, 2),
+    sMAPE = round(smape, 2),
+    WMAPE = round(wmape, 2),
+    MdAPE = round(mdape, 2),
+    MAPE  = round(mape_all, 2),
+    MAPE_clip = round(mape_clip, 2),
+    MAPE_hi   = round(mape_hi, 2),
+    RMSLE     = round(rmsle, 4),
+    MASE      = round(mase, 3)
+  )
+  for (nm in names(covs)) out[[nm]] <- round(covs[[nm]], 1)
+  for (nm in names(iss))  out[[nm]] <- round(iss[[nm]], 2)
+  out
+}
+
+fit_and_forecast_one_year_D <- function(train_end_year, forecast_year,
+                                        weekly_df, xreg_full,
+                                        clip = 10, N = 5000, seed = 123,
+                                        levels = c(80,95),
+                                        point = c("median","mean")){
+  point <- match.arg(point)
+  
+  train_end <- last_monday_of_year(train_end_year)
+  y_all <- weekly_df %>% arrange(semana) %>% pull(casos)
+  
+  y_train_all <- weekly_df %>%
+    filter(semana >= first_monday_of_year(2007),
+           semana <= train_end) %>%
+    arrange(semana) %>%
+    pull(casos)
+  
+  X_train_all <- xreg_full %>%
+    filter(semana >= first_monday_of_year(2007),
+           semana <= train_end) %>%
+    arrange(semana) %>%
+    select(-semana) %>%
+    as.matrix()
+  
+  keep   <- stats::complete.cases(X_train_all)
+  y_train <- y_train_all[keep]
+  X_train <- X_train_all[keep, , drop = FALSE]
+  
+  X_all      <- xreg_full %>% arrange(semana) %>% select(-semana) %>% as.matrix()
+  scaler     <- scale_train_apply(X_train, X_all)
+  X_train_sc <- scaler$train
+  X_all_sc   <- scaler$apply
+  
+  semanas_forecast <- mondays_in_year(forecast_year)
+  h  <- length(semanas_forecast)
+  id <- which(weekly_df$semana %in% semanas_forecast)
+  X_future_sc <- X_all_sc[id, , drop = FALSE]
+  
+  y_raw <- ts(y_train, frequency = 52)
+  y_pos <- y_raw + 1
+  lambda <- BoxCox.lambda(y_pos, lower = 0)
+  y_bc   <- BoxCox(y_pos, lambda)
+  
+  d_sug <- ndiffs(y_bc)
+  D_sug <- nsdiffs(y_bc, m = frequency(y_bc))
+  
+  modelo <- auto.arima(
+    y_bc,
+    xreg        = X_train_sc,
+    seasonal    = TRUE,
+    d           = d_sug,
+    D           = max(1, D_sug),
+    stepwise    = FALSE,
+    approximation = FALSE,
+    lambda      = NULL,
+    biasadj     = FALSE,
+    allowdrift  = FALSE,
+    allowmean   = FALSE
+  )
+  
+  # --------- SIMULACIÓN SECUENCIAL (N réplicas) ----------
+  set.seed(seed)
+  sim_bc <- replicate(
+    N,
+    as.numeric(
+      simulate(
+        object    = modelo,
+        nsim      = h,
+        future    = TRUE,
+        bootstrap = TRUE,
+        xreg      = X_future_sc
+      )
+    )
+  )
+  
+  to_orig  <- function(z) pmax(InvBoxCox(z, lambda) - 1, 0)
+  sim_orig <- apply(sim_bc, 2, to_orig)  # h x N
+  
+  pred_point <- if (point == "median") {
+    apply(sim_orig, 1, median, na.rm = TRUE)
+  } else {
+    rowMeans(sim_orig, na.rm = TRUE)
+  }
+  
+  pred_df <- tibble(
+    semana          = semanas_forecast,
+    casos_predichos = as.numeric(pred_point)
+  )
+  
+  band_list <- list()
+  for (lvl in sort(unique(levels))) {
+    alpha <- 1 - lvl/100
+    lo <- apply(sim_orig, 1, quantile, probs = alpha/2,     na.rm = TRUE, names = FALSE)
+    hi <- apply(sim_orig, 1, quantile, probs = 1-alpha/2, na.rm = TRUE, names = FALSE)
+    pred_df[[paste0("lo", lvl)]] <- lo
+    pred_df[[paste0("hi", lvl)]] <- hi
+    band_list[[length(band_list)+1]] <- list(level = lvl, lo = lo, hi = hi)
+  }
+  
+  reales_df <- weekly_df %>%
+    filter(semana >= first_monday_of_year(forecast_year),
+           semana <= last_monday_of_year(forecast_year)) %>%
+    select(semana, casos)
+  
+  comparacion <- pred_df %>%
+    left_join(reales_df, by = "semana") %>%
+    rename(casos_reales = casos) %>%
+    mutate(
+      casos_reales = replace_na(casos_reales, 0),
+      residuo      = casos_reales - casos_predichos
+    )
+  
+  # baseline snaive para DM
+  snaive_all  <- dplyr::lag(y_all, 52)
+  snaive_pred <- snaive_all[id]
+  comparacion$snaive <- snaive_pred
+  
+  e_model  <- comparacion$casos_reales - comparacion$casos_predichos
+  e_snaive <- comparacion$casos_reales - comparacion$snaive
+  ok <- is.finite(e_model) & is.finite(e_snaive)
+  
+  if (sum(ok) > 5) {
+    dm <- try(
+      forecast::dm.test(
+        e_model[ok], e_snaive[ok],
+        alternative = "less", h = 1, power = 2
+      ),
+      silent = TRUE
+    )
+    if (inherits(dm, "try-error")) {
+      DM_stat <- NA_real_; DM_pval <- NA_real_
+    } else {
+      DM_stat <- unname(as.numeric(dm$statistic))
+      DM_pval <- dm$p.value
+    }
+  } else {
+    DM_stat <- NA_real_; DM_pval <- NA_real_
+  }
+  
+  r <- residuals(modelo)
+  k <- length(coef(modelo))
+  lagLB <- min(52, length(r) - k - 1)
+  if (is.na(lagLB) || lagLB < 1) {
+    LB_stat <- NA_real_; LB_pval <- NA_real_
+  } else {
+    lb <- try(
+      Box.test(r, lag = lagLB, type = "Ljung-Box", fitdf = k),
+      silent = TRUE
+    )
+    if (inherits(lb, "try-error")) {
+      LB_stat <- NA_real_; LB_pval <- NA_real_
+    } else {
+      LB_stat <- unname(as.numeric(lb$statistic))
+      LB_pval <- lb$p.value
+    }
+  }
+  
+  metrics_tbl <- safe_metrics(
+    actual  = comparacion$casos_reales,
+    pred    = comparacion$casos_predichos,
+    y_train = y_train,
+    m       = 52,
+    clip    = clip,
+    bands   = band_list
+  ) %>%
+    mutate(
+      DM_stat   = round(DM_stat, 3),
+      DM_pvalue = round(DM_pval, 4),
+      LB_stat   = round(LB_stat, 3),
+      LB_pvalue = round(LB_pval, 4)
+    )
+  
+  list(
+    modelo      = modelo,
+    lambda      = lambda,
+    comparacion = comparacion,
+    metrics     = mutate(metrics_tbl, Anio = forecast_year, .before = 1)
+  )
+}
+
+## --- 6) Ejecutar Modelo D para 2021–2024 (paralelo por año) -----
+
+# Plan de paralelización: 4 workers (ajustable)
+workers <- 4L
+plan(multisession, workers = workers)
+
+seed_all <- 123
+
+train_years    <- 2020:2023   # años de fin de entrenamiento
+forecast_years <- 2021:2024   # años a pronosticar
+
+res_list <- future_map2(
+  train_years,
+  forecast_years,
+  ~fit_and_forecast_one_year_D(
+    train_end_year = .x,
+    forecast_year  = .y,
+    weekly_df      = weekly_full,
+    xreg_full      = xreg_D_full,
+    clip           = 10,
+    N              = 5000,
+    seed           = seed_all,
+    levels         = c(80, 95),
+    point          = "median"
+  ),
+  .options = furrr_options(seed = seed_all),
+  .progress = TRUE
+)
+
+resD_2021 <- res_list[[1]]
+resD_2022 <- res_list[[2]]
+resD_2023 <- res_list[[3]]
+resD_2024 <- res_list[[4]]
+
+comparacionD_2021 <- resD_2021$comparacion
+comparacionD_2022 <- resD_2022$comparacion
+comparacionD_2023 <- resD_2023$comparacion
+comparacionD_2024 <- resD_2024$comparacion
+
+tabla_metricas_D <- bind_rows(
+  resD_2021$metrics,
+  resD_2022$metrics,
+  resD_2023$metrics,
+  resD_2024$metrics
+) %>%
+  arrange(Anio)
+
+print(tabla_metricas_D)
+
+pretty_pct <- function(x) ifelse(is.na(x), NA, paste0(format(round(x, 1), nsmall = 1), "%"))
+tabla_metricas_D_pretty <- tabla_metricas_D %>%
+  mutate(
+    sMAPE     = pretty_pct(sMAPE),
+    WMAPE     = pretty_pct(WMAPE),
+    MdAPE     = pretty_pct(MdAPE),
+    MAPE      = pretty_pct(MAPE),
+    MAPE_clip = pretty_pct(MAPE_clip),
+    MAPE_hi   = pretty_pct(MAPE_hi),
+    DM_stat   = round(DM_stat, 3),
+    DM_pvalue = format(round(DM_pvalue, 4), nsmall = 4),
+    LB_stat   = round(LB_stat, 3),
+    LB_pvalue = format(round(LB_pvalue, 4), nsmall = 4)
+  )
+
+print(tabla_metricas_D_pretty, row.names = FALSE)
+
+## --- 7) Gráficas y exportes ------------------------------------
+
+plot_real_vs_pred_D <- function(comp_df, year,
+                                titulo = "Eventos de Dengue en Cali - Modelo D (SARIMAX clima + Google Trends)"){
+  band_cols <- names(comp_df)
+  los <- grep("^lo\\d+$", band_cols, value = TRUE)
+  his <- gsub("^lo", "hi", los)
+  ord <- order(as.integer(gsub("^lo", "", los)), decreasing = TRUE)
+  los <- los[ord]; his <- his[ord]
+  
+  g <- ggplot(comp_df, aes(x = semana)) +
+    geom_line(aes(y = casos_reales,    linetype = "Observados", color = "Observados"), linewidth = 1) +
+    geom_line(aes(y = casos_predichos, linetype = "Predichos",  color = "Predichos")) +
+    scale_linetype_manual(
+      name   = "Serie",
+      values = c("Observados" = "solid", "Predichos" = "dashed"),
+      breaks = c("Observados", "Predichos"),
+      labels = c("Observados (línea continua)", "Predichos (línea punteada)")
+    ) +
+    scale_color_manual(
+      name   = "Serie",
+      values = c("Observados" = "black", "Predichos" = "darkblue"),
+      breaks = c("Observados", "Predichos"),
+      labels = c("Observados (línea continua)", "Predichos (línea punteada)")
+    ) +
+    labs(
+      title = paste0(titulo, " (", year, ")"),
+      x = "Tiempo (semanas)",
+      y = "Eventos de dengue"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.box       = "horizontal",
+      plot.title       = element_text(hjust = 0.5)
+    )
+  print(g)
+}
+
+plot_real_vs_pred_D(comparacionD_2021, 2021)
+plot_real_vs_pred_D(comparacionD_2022, 2022)
+plot_real_vs_pred_D(comparacionD_2023, 2023)
+plot_real_vs_pred_D(comparacionD_2024, 2024)
+
+write_xlsx(
+  list(
+    metricas        = tabla_metricas_D,
+    metricas_pretty = tabla_metricas_D_pretty
+  ),
+  path = "metricas_modelo_D_SARIMAX_clima_GT.xlsx"
+)
+cat("Archivo Excel exportado: metricas_modelo_D.xlsx\n")
+
+resultados_modelo_D <- bind_rows(
+  comparacionD_2021 %>% mutate(Anio = 2021, Modelo = "D"),
+  comparacionD_2022 %>% mutate(Anio = 2022, Modelo = "D"),
+  comparacionD_2023 %>% mutate(Anio = 2023, Modelo = "D"),
+  comparacionD_2024 %>% mutate(Anio = 2024, Modelo = "D")
+) %>%
+  select(Anio, Modelo, semana, casos_reales, casos_predichos)
+
+saveRDS(resultados_modelo_D, file = "resultados_modelo_D_2021_2024.rds")
+cat("Guardado: resultados_modelo_D_2021_2024.rds\n")
