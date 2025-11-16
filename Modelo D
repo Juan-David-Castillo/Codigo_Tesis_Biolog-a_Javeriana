@@ -24,8 +24,6 @@ library(furrr)
 
 options(scipen = 999)
 
-## --- 1) Casos de dengue semanales (weekly_full) -----------------
-
 patch_list_events <- function(years = 2007:2024) {
   my_list_events_safe <- function(...) {
     data.frame(
@@ -88,8 +86,6 @@ weekly_full <- all_mondays %>%
   mutate(casos = replace_na(casos, 0L)) %>%
   arrange(semana)
 
-## --- 2) Covariables climáticas (como Modelo B) ------------------
-
 lat <- 3.44; lon <- -76.519722
 parameters <- c("T2M","T2M_MAX","T2M_MIN","RH2M","PRECTOTCORR")
 
@@ -142,8 +138,6 @@ make_lagged_clima <- function(weekly_meteo,
   X %>% select(semana, all_of(keep_cols))
 }
 
-## --- 3) Covariables Google Trends (como Modelo C) ---------------
-
 gt_raw <- read_csv(
   "multiTimeline.csv",
   skip = 2,
@@ -186,16 +180,12 @@ make_lagged_gt <- function(weekly_gt, lags = 2:8){
   X %>% select(semana, starts_with("GT_L"))
 }
 
-## --- 4) Matriz combinada de covariables (clima + GT) ------------
-
 xreg_clima_lagged <- make_lagged_clima(climate_weekly, lags = 2:8)
 xreg_gt_lagged    <- make_lagged_gt(gt_weekly,      lags = 2:8)
 
 xreg_D_full <- weekly_full %>%
   left_join(xreg_clima_lagged, by = "semana") %>%
   left_join(xreg_gt_lagged,    by = "semana")
-
-## --- 5) Escalado, métricas y función de ajuste SARIMAX ----------
 
 scale_train_apply <- function(x_train, x_all){
   mu  <- colMeans(x_train, na.rm = TRUE)
@@ -322,7 +312,6 @@ fit_and_forecast_one_year_D <- function(train_end_year, forecast_year,
     allowmean   = FALSE
   )
   
-  # --------- SIMULACIÓN SECUENCIAL (N réplicas) ----------
   set.seed(seed)
   sim_bc <- replicate(
     N,
@@ -374,7 +363,6 @@ fit_and_forecast_one_year_D <- function(train_end_year, forecast_year,
       residuo      = casos_reales - casos_predichos
     )
   
-  # baseline snaive para DM
   snaive_all  <- dplyr::lag(y_all, 52)
   snaive_pred <- snaive_all[id]
   comparacion$snaive <- snaive_pred
@@ -442,16 +430,13 @@ fit_and_forecast_one_year_D <- function(train_end_year, forecast_year,
   )
 }
 
-## --- 6) Ejecutar Modelo D para 2021–2024 (paralelo por año) -----
-
-# Plan de paralelización: 4 workers (ajustable)
 workers <- 4L
 plan(multisession, workers = workers)
 
 seed_all <- 123
 
-train_years    <- 2020:2023   # años de fin de entrenamiento
-forecast_years <- 2021:2024   # años a pronosticar
+train_years    <- 2020:2023   
+forecast_years <- 2021:2024   
 
 res_list <- future_map2(
   train_years,
@@ -508,8 +493,6 @@ tabla_metricas_D_pretty <- tabla_metricas_D %>%
 
 print(tabla_metricas_D_pretty, row.names = FALSE)
 
-## --- 7) Gráficas y exportes ------------------------------------
-
 plot_real_vs_pred_D <- function(comp_df, year,
                                 titulo = "Eventos de Dengue en Cali - Modelo D (SARIMAX clima + Google Trends)"){
   band_cols <- names(comp_df)
@@ -558,9 +541,9 @@ write_xlsx(
     metricas        = tabla_metricas_D,
     metricas_pretty = tabla_metricas_D_pretty
   ),
-  path = "metricas_modelo_D_SARIMAX_clima_GT.xlsx"
+  path = "Metricas_Modelo D.xlsx"
 )
-cat("Archivo Excel exportado: metricas_modelo_D.xlsx\n")
+cat("Metricas_Modelo D.xlsx\n")
 
 resultados_modelo_D <- bind_rows(
   comparacionD_2021 %>% mutate(Anio = 2021, Modelo = "D"),
