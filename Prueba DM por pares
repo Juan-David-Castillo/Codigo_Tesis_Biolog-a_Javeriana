@@ -1,0 +1,180 @@
+library(tidyverse)
+library(forecast)
+library(writexl)
+
+# Leer resultados de los cuatro modelos -----------------------------
+resA <- readRDS("resultados_modelo_A_2021_2024.rds")
+resB <- readRDS("resultados_modelo_B_2021_2024.rds")
+resC <- readRDS("resultados_modelo_C_2021_2024.rds")
+resD <- readRDS("resultados_modelo_D_2021_2024.rds")
+
+# Renombrar columnas de cada modelo ---------------------------------
+resA2 <- resA %>%
+  dplyr::rename(
+    casos_reales_A    = casos_reales,
+    casos_predichos_A = casos_predichos
+  )
+
+resB2 <- resB %>%
+  dplyr::rename(
+    casos_reales_B    = casos_reales,
+    casos_predichos_B = casos_predichos
+  )
+
+resC2 <- resC %>%
+  dplyr::rename(
+    casos_reales_C    = casos_reales,
+    casos_predichos_C = casos_predichos
+  )
+
+resD2 <- resD %>%
+  dplyr::rename(
+    casos_reales_D    = casos_reales,
+    casos_predichos_D = casos_predichos
+  )
+
+# Unir A, B, C, D por año y semana ----------------------------------
+AB_join <- resA2 %>%
+  dplyr::inner_join(
+    resB2,
+    by = c("Anio", "semana")
+  )
+
+ABC_join <- AB_join %>%
+  dplyr::inner_join(
+    resC2,
+    by = c("Anio", "semana")
+  )
+
+ABCD_join <- ABC_join %>%
+  dplyr::inner_join(
+    resD2,
+    by = c("Anio", "semana")
+  )
+
+# Verificar que los casos reales sean iguales en los cuatro modelos --
+stopifnot(all.equal(ABCD_join$casos_reales_A, ABCD_join$casos_reales_B))
+stopifnot(all.equal(ABCD_join$casos_reales_A, ABCD_join$casos_reales_C))
+stopifnot(all.equal(ABCD_join$casos_reales_A, ABCD_join$casos_reales_D))
+
+# Función general para DM por año -----------------------------------
+dm_pair_por_anio <- function(df, year,
+                             col_pred_ref,  # modelo de referencia
+                             col_pred_alt,  # modelo alternativo
+                             alternative = "less") {
+  dfy <- df %>% dplyr::filter(Anio == year)
+  
+  # Todos los modelos comparten la misma serie real (ya verificado arriba)
+  y    <- dfy$casos_reales_A
+  
+  eRef <- y - dfy[[col_pred_ref]]
+  eAlt <- y - dfy[[col_pred_alt]]
+  
+  idx <- is.finite(eRef) & is.finite(eAlt)
+  n_valid <- sum(idx)
+  
+  if (n_valid <= 5) {
+    return(tibble::tibble(
+      Anio    = year,
+      DM_stat = NA_real_,
+      DM_pval = NA_real_,
+      n       = n_valid
+    ))
+  }
+  
+  dm <- forecast::dm.test(
+    eAlt[idx], eRef[idx],
+    h = 1, power = 2,
+    alternative = alternative
+  )
+  
+  tibble::tibble(
+    Anio    = year,
+    DM_stat = unname(dm$statistic),
+    DM_pval = dm$p.value,
+    n       = n_valid
+  )
+}
+
+# ---------- Comparaciones de pares de modelos ----------------------
+
+# B vs A
+dm_AB_resultados <- dplyr::bind_rows(
+  dm_pair_por_anio(ABCD_join, 2021, "casos_predichos_A", "casos_predichos_B"),
+  dm_pair_por_anio(ABCD_join, 2022, "casos_predichos_A", "casos_predichos_B"),
+  dm_pair_por_anio(ABCD_join, 2023, "casos_predichos_A", "casos_predichos_B"),
+  dm_pair_por_anio(ABCD_join, 2024, "casos_predichos_A", "casos_predichos_B")
+) %>%
+  dplyr::mutate(Comparacion = "B vs A") %>%
+  dplyr::select(Comparacion, dplyr::everything())
+
+# C vs A
+dm_AC_resultados <- dplyr::bind_rows(
+  dm_pair_por_anio(ABCD_join, 2021, "casos_predichos_A", "casos_predichos_C"),
+  dm_pair_por_anio(ABCD_join, 2022, "casos_predichos_A", "casos_predichos_C"),
+  dm_pair_por_anio(ABCD_join, 2023, "casos_predichos_A", "casos_predichos_C"),
+  dm_pair_por_anio(ABCD_join, 2024, "casos_predichos_A", "casos_predichos_C")
+) %>%
+  dplyr::mutate(Comparacion = "C vs A") %>%
+  dplyr::select(Comparacion, dplyr::everything())
+
+# C vs B
+dm_BC_resultados <- dplyr::bind_rows(
+  dm_pair_por_anio(ABCD_join, 2021, "casos_predichos_B", "casos_predichos_C"),
+  dm_pair_por_anio(ABCD_join, 2022, "casos_predichos_B", "casos_predichos_C"),
+  dm_pair_por_anio(ABCD_join, 2023, "casos_predichos_B", "casos_predichos_C"),
+  dm_pair_por_anio(ABCD_join, 2024, "casos_predichos_B", "casos_predichos_C")
+) %>%
+  dplyr::mutate(Comparacion = "C vs B") %>%
+  dplyr::select(Comparacion, dplyr::everything())
+
+# D vs A
+dm_AD_resultados <- dplyr::bind_rows(
+  dm_pair_por_anio(ABCD_join, 2021, "casos_predichos_A", "casos_predichos_D"),
+  dm_pair_por_anio(ABCD_join, 2022, "casos_predichos_A", "casos_predichos_D"),
+  dm_pair_por_anio(ABCD_join, 2023, "casos_predichos_A", "casos_predichos_D"),
+  dm_pair_por_anio(ABCD_join, 2024, "casos_predichos_A", "casos_predichos_D")
+) %>%
+  dplyr::mutate(Comparacion = "D vs A") %>%
+  dplyr::select(Comparacion, dplyr::everything())
+
+# D vs B
+dm_BD_resultados <- dplyr::bind_rows(
+  dm_pair_por_anio(ABCD_join, 2021, "casos_predichos_B", "casos_predichos_D"),
+  dm_pair_por_anio(ABCD_join, 2022, "casos_predichos_B", "casos_predichos_D"),
+  dm_pair_por_anio(ABCD_join, 2023, "casos_predichos_B", "casos_predichos_D"),
+  dm_pair_por_anio(ABCD_join, 2024, "casos_predichos_B", "casos_predichos_D")
+) %>%
+  dplyr::mutate(Comparacion = "D vs B") %>%
+  dplyr::select(Comparacion, dplyr::everything())
+
+# D vs C
+dm_CD_resultados <- dplyr::bind_rows(
+  dm_pair_por_anio(ABCD_join, 2021, "casos_predichos_C", "casos_predichos_D"),
+  dm_pair_por_anio(ABCD_join, 2022, "casos_predichos_C", "casos_predichos_D"),
+  dm_pair_por_anio(ABCD_join, 2023, "casos_predichos_C", "casos_predichos_D"),
+  dm_pair_por_anio(ABCD_join, 2024, "casos_predichos_C", "casos_predichos_D")
+) %>%
+  dplyr::mutate(Comparacion = "D vs C") %>%
+  dplyr::select(Comparacion, dplyr::everything())
+
+# Unir todos los resultados DM --------------------------------------
+dm_todos <- dplyr::bind_rows(
+  dm_AB_resultados,
+  dm_AC_resultados,
+  dm_BC_resultados,
+  dm_AD_resultados,
+  dm_BD_resultados,
+  dm_CD_resultados
+) %>%
+  dplyr::arrange(Comparacion, Anio)
+
+print(dm_todos)
+
+# Exportar a Excel (incluyendo el modelo D) --------------------------
+writexl::write_xlsx(
+  dm_todos,
+  path = "tests_DM_modelos_A_B_C_D.xlsx"
+)
+
+cat("Archivo Excel exportado: tests_DM_modelos_A_B_C_D.xlsx\n")
